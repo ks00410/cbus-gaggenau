@@ -4,8 +4,26 @@ require("user.secrets")
 -- SECTION 1 — REQUIRE / MODULE TABLE
 -- =============================================================================
 
-local json = require("json")
-local ws   = require("user.websocket")
+local json   = require("json")
+local ws     = require("user.websocket")
+local ffi    = require("ffi")
+local encdec = require("encdec")
+
+-- OpenSSL libcrypto — used for HMAC-SHA256 key derivation and HMAC tags.
+local crypto = ffi.load("crypto")
+
+ffi.cdef[[
+  /* ── HMAC-SHA256 ─────────────────────────────────────────────────── */
+  typedef struct evp_md_st   EVP_MD;
+  typedef struct hmac_ctx_st HMAC_CTX;
+
+  const EVP_MD *EVP_sha256(void);
+
+  unsigned char *HMAC(const EVP_MD *evp_md,
+                      const void *key, int key_len,
+                      const unsigned char *d, size_t n,
+                      unsigned char *md, unsigned int *md_len);
+]]
 
 local G = {}
 gaggenau = G
@@ -147,19 +165,192 @@ local function copyFallbackMap()
   return map
 end
 
--- TODO: Adapt user.aes (from Unisenza gold-standard) for Home Connect AES
--- framing. See research doc 08-gaggenau-home-connect.md for the exact padding
--- and HMAC-SHA256 chain specification. Key derivation: enckey = HMAC-SHA256(psk,
--- 'ENC'), mackey = HMAC-SHA256(psk, 'MAC').
--- For now these stubs pass plaintext through unmodified. This is correct for
--- testing the message protocol and for TLS-mode appliances, where no AES layer
--- is needed; AES-mode appliances still require this adaptation.
-local function aesEncrypt(plaintext)
-  return plaintext
+-- ── Home Connect AES framing ────────────────────────────────────────────────
+-- Spec (from homeconnect_websocket/socket.py):
+--   Key derivation:
+--     enckey  = HMAC-SHA256(psk_bytes, b"ENC")    -- 32 bytes
+--     mackey  = HMAC-SHA256(psk_bytes, b"MAC")    -- 32 bytes
+--   Padding (send):
+--     padded  = msg + 0x00 + random(padlen-2) + byte(padlen)
+--     where padlen makes total length a multiple of 16, minimum 1 byte of random
+--   Encrypt (send):
+--     ciphertext = AES-256-CBC(enckey, iv, padded)
+--     hmac_tag   = HMAC-SHA256(mackey, iv + 0x45 + last_tx_hmac + ciphertext)[0:16]
+--     frame      = ciphertext + hmac_tag
+--   Decrypt (receive):
+--     ciphertext = frame[1 .. #frame-16]
+--     hmac_tag   = frame[#frame-15 .. #frame]
+--     verify HMAC-SHA256(mackey, iv + 0x45 + last_rx_hmac + ciphertext)[0:16] == hmac_tag
+--     plain      = AES-256-CBC-decrypt(enckey, iv, ciphertext), strip padding
+--
+-- The IV is the per-appliance value from the downloaded profile (16 bytes).
+-- CBC IV chaining across a session is handled by the stateful tx/rx HMAC state.
+
+-- HMAC-SHA256: returns 32-byte binary digest.
+local function hmacSha256(key, data)
+  local out = ffi.new("unsigned char[32]")
+  local outlen = ffi.new("unsigned int[1]", 32)
+  crypto.HMAC(crypto.EVP_sha256(), key, #key, data, #data, out, outlen)
+  return ffi.string(out, 32)
 end
 
-local function aesDecrypt(ciphertext)
-  return ciphertext
+-- Decode a base64url string to binary (urlsafe: - and _ replace + and /).
+local function b64urlDecode(s)
+  local b64 = s:gsub("-", "+"):gsub("_", "/")
+  -- Pad to multiple of 4.
+  local pad = (4 - #b64 % 4) % 4
+  b64 = b64 .. string.rep("=", pad)
+  return encdec.base64dec(b64)
+end
+
+-- Derive enckey and mackey from the per-appliance PSK (base64url-encoded string
+-- from the downloaded profile, or raw binary if already decoded).
+local function deriveKeys(pskRaw)
+  local enckey = hmacSha256(pskRaw, "ENC")
+  local mackey = hmacSha256(pskRaw, "MAC")
+  return enckey, mackey
+end
+
+-- Home Connect custom padding:
+--   msg + 0x00 + random(padlen-2) + byte(padlen)
+-- where padlen is chosen so that #msg + padlen is a multiple of 16, min padlen=2.
+local function hcPad(msg)
+  local padlen = 16 - (#msg % 16)
+  if padlen < 2 then padlen = padlen + 16 end
+  local tail = {}
+  for i = 1, padlen - 2 do tail[i] = string.char(math.random(0, 255)) end
+  tail[#tail + 1] = string.char(padlen)
+  return msg .. "\0" .. table.concat(tail)
+end
+
+-- Strip the Home Connect padding from a decrypted block.
+local function hcUnpad(data)
+  if #data == 0 then return data end
+  local padlen = string.byte(data, #data)
+  if padlen > #data then return data end
+  -- Find the 0x00 separator: it should be at position (#data - padlen + 1).
+  local sepPos = #data - padlen + 1
+  if string.byte(data, sepPos) ~= 0 then return data end
+  return data:sub(1, sepPos - 1)
+end
+
+-- AES-256-CBC raw encrypt/decrypt without PKCS#7 padding, using direct
+-- OpenSSL FFI calls (same crypto handle already loaded above).
+-- We declare the required EVP cipher symbols here at module load time.
+
+ffi.cdef[[
+  typedef struct evp_cipher_ctx_st EVP_CIPHER_CTX;
+  typedef struct evp_cipher_st     EVP_CIPHER;
+  EVP_CIPHER_CTX    *EVP_CIPHER_CTX_new(void);
+  void               EVP_CIPHER_CTX_free(EVP_CIPHER_CTX *ctx);
+  int                EVP_CIPHER_CTX_set_padding(EVP_CIPHER_CTX *ctx, int pad);
+  const EVP_CIPHER  *EVP_aes_256_cbc(void);
+  int EVP_EncryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *type,
+                         void *impl, const unsigned char *key,
+                         const unsigned char *iv);
+  int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+                        const unsigned char *in, int inl);
+  int EVP_EncryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl);
+  int EVP_DecryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *type,
+                         void *impl, const unsigned char *key,
+                         const unsigned char *iv);
+  int EVP_DecryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+                        const unsigned char *in, int inl);
+  int EVP_DecryptFinal_ex(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl);
+]]
+
+-- AES-256-CBC encrypt, no padding (input must be block-aligned).
+local function aesCbcEncryptRaw(key, iv, data)
+  local evp = crypto.EVP_CIPHER_CTX_new()
+  crypto.EVP_EncryptInit_ex(evp, crypto.EVP_aes_256_cbc(), nil, key, iv)
+  crypto.EVP_CIPHER_CTX_set_padding(evp, 0)   -- disable PKCS#7
+  local inlen  = #data
+  local outbuf = ffi.new("unsigned char[?]", inlen + 16)
+  local outl   = ffi.new("int[1]")
+  local total  = ffi.new("int[1]")
+  crypto.EVP_EncryptUpdate(evp, outbuf, outl, data, inlen)
+  total[0] = outl[0]
+  crypto.EVP_EncryptFinal_ex(evp, outbuf + total[0], outl)
+  total[0] = total[0] + outl[0]
+  crypto.EVP_CIPHER_CTX_free(evp)
+  return ffi.string(outbuf, total[0])
+end
+
+-- AES-256-CBC decrypt, no padding (strips nothing — caller uses hcUnpad).
+local function aesCbcDecryptRaw(key, iv, data)
+  local evp = crypto.EVP_CIPHER_CTX_new()
+  crypto.EVP_DecryptInit_ex(evp, crypto.EVP_aes_256_cbc(), nil, key, iv)
+  crypto.EVP_CIPHER_CTX_set_padding(evp, 0)   -- disable PKCS#7
+  local inlen  = #data
+  local outbuf = ffi.new("unsigned char[?]", inlen)
+  local outl   = ffi.new("int[1]")
+  local total  = ffi.new("int[1]")
+  crypto.EVP_DecryptUpdate(evp, outbuf, outl, data, inlen)
+  total[0] = outl[0]
+  crypto.EVP_DecryptFinal_ex(evp, outbuf + total[0], outl)
+  total[0] = total[0] + outl[0]
+  crypto.EVP_CIPHER_CTX_free(evp)
+  return ffi.string(outbuf, total[0])
+end
+
+-- Module-level AES session state (per appliance; reset on each new connection).
+local _aesState = {
+  enckey     = nil,
+  mackey     = nil,
+  iv         = nil,
+  lastTxHmac = string.rep("\0", 32),
+  lastRxHmac = string.rep("\0", 32),
+}
+
+-- Initialise AES session state from the appliance credentials.
+-- psk64 = base64url-encoded PSK from the downloaded profile.
+-- iv64  = base64url-encoded IV from the downloaded profile.
+local function initAesSession(psk64, iv64)
+  local pskRaw = b64urlDecode(psk64)
+  local ivRaw  = b64urlDecode(iv64)
+  _aesState.enckey, _aesState.mackey = deriveKeys(pskRaw)
+  _aesState.iv         = ivRaw
+  _aesState.lastTxHmac = string.rep("\0", 32)
+  _aesState.lastRxHmac = string.rep("\0", 32)
+end
+
+-- Encrypt a plaintext JSON string using the Home Connect AES framing.
+-- Returns the binary frame (ciphertext + 16-byte HMAC tag).
+local function aesEncrypt(plaintext)
+  if not _aesState.enckey then
+    log("GAGGENAU: AES session not initialised — call initAesSession first")
+    return plaintext
+  end
+  local padded    = hcPad(plaintext)
+  local cipher    = aesCbcEncryptRaw(_aesState.enckey, _aesState.iv, padded)
+  local hmacInput = _aesState.iv .. "\x45" .. _aesState.lastTxHmac .. cipher
+  local tag       = hmacSha256(_aesState.mackey, hmacInput):sub(1, 16)
+  _aesState.lastTxHmac = hmacSha256(_aesState.mackey, hmacInput)
+  return cipher .. tag
+end
+
+-- Decrypt a binary frame received from the appliance.
+-- Returns the plaintext JSON string, or nil on HMAC verification failure.
+local function aesDecrypt(frame)
+  if not _aesState.mackey then
+    log("GAGGENAU: AES session not initialised — call initAesSession first")
+    return frame
+  end
+  if #frame < 17 then
+    log("GAGGENAU: AES frame too short (" .. #frame .. " bytes)")
+    return nil
+  end
+  local cipher  = frame:sub(1, #frame - 16)
+  local rxTag   = frame:sub(#frame - 15)
+  local hmacInput = _aesState.iv .. "\x45" .. _aesState.lastRxHmac .. cipher
+  local expected  = hmacSha256(_aesState.mackey, hmacInput):sub(1, 16)
+  if rxTag ~= expected then
+    log("GAGGENAU: AES HMAC verification failed — frame rejected")
+    return nil
+  end
+  _aesState.lastRxHmac = hmacSha256(_aesState.mackey, hmacInput)
+  local plain = aesCbcDecryptRaw(_aesState.enckey, _aesState.iv, cipher)
+  return hcUnpad(plain)
 end
 
 local function encodeMessage(message, credentials)
@@ -260,19 +451,29 @@ local function credentialsFor(host)
   local credentials = secrets and secrets.gaggenau
   if not credentials then errorlog("secrets.gaggenau is not configured"); return nil end
   if host == credentials.oven_host then
-    return credentials, credentials.oven_mode or "AES"
+    return credentials, credentials.oven_mode or "AES",
+           credentials.oven_key, credentials.oven_iv
   elseif host == credentials.cooktop_host then
-    return credentials, credentials.cooktop_mode or "AES"
+    return credentials, credentials.cooktop_mode or "AES",
+           credentials.cooktop_key, credentials.cooktop_iv
   end
   errorlog("No Gaggenau credentials configured for host " .. tostring(host))
   return nil
 end
 
 function G.Connect(host, dbg)
-  local credentials, mode = credentialsFor(host)
+  local credentials, mode, psk64, iv64 = credentialsFor(host)
   if not credentials then return nil end
   _activeCredentials = credentials
   _activeMode = mode
+  -- Initialise AES session state whenever we open a new connection.
+  if mode == "AES" then
+    if not psk64 or not iv64 then
+      errorlog("AES mode selected but oven_key or oven_iv missing from secrets.gaggenau")
+      return nil
+    end
+    initAesSession(psk64, iv64)
+  end
   local scheme = mode == "TLS" and "wss://" or "ws://"
   local path = mode == "TLS" and ":443/homeconnect" or "/homeconnect"
   local conn = ws.new()
